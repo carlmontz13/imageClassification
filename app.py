@@ -147,7 +147,7 @@ def predict():
 # ---------------------- #
 @app.route("/")
 def home():
-    return "Face Recognition API is Running!"
+    return render_template("index.html")
 
 # ---------------------- #
 # 🔹 Run Flask App
