@@ -2,5 +2,6 @@ flask
 flask_cors
 scikit-learn
 gunicorn
-tensorflow
+# tensorflow
+tensorflow-cpu  # Replace "tensorflow" with "tensorflow-cpu"
 Pillow
