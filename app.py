@@ -1,142 +1,156 @@
 import os
-import shutil
-import random
+import json
+import threading
 import numpy as np
 import tensorflow as tf
-from flask import Flask, render_template, request, jsonify
-from werkzeug.utils import secure_filename
-from tensorflow.keras.preprocessing.image import ImageDataGenerator, load_img, img_to_array
+from flask import Flask, request, jsonify
+from tensorflow.keras.models import load_model, Model
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras import layers
+from tensorflow.keras.preprocessing.image import img_to_array, load_img
 
-app = Flask(__name__)
-
-# Define directories
+# Constants
+MODEL_PATH = "model.h5"
+LABELS_PATH = "class_labels.json"
 UPLOAD_FOLDER = "uploads"
 TRAIN_FOLDER = "train_data"
-MODEL_PATH = "model.h5"
-
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
 # Ensure folders exist
 for folder in [UPLOAD_FOLDER, TRAIN_FOLDER]:
     os.makedirs(folder, exist_ok=True)
 
-# Function to preprocess images for training
-def preprocess_images():
-    datagen = ImageDataGenerator(rescale=1.0 / 255, validation_split=0.2)  # Data normalization
+app = Flask(__name__)
 
-    train_generator = datagen.flow_from_directory(
-        TRAIN_FOLDER,
-        target_size=(128, 128),
-        batch_size=32,
-        class_mode="categorical",
-        subset="training"
-    )
+# Load model if exists, otherwise initialize later
+model = load_model(MODEL_PATH) if os.path.exists(MODEL_PATH) else None
 
-    val_generator = datagen.flow_from_directory(
-        TRAIN_FOLDER,
-        target_size=(128, 128),
-        batch_size=32,
-        class_mode="categorical",
-        subset="validation"
-    )
+# Load class labels if they exist
+if os.path.exists(LABELS_PATH):
+    with open(LABELS_PATH, "r") as f:
+        class_labels = json.load(f)
+else:
+    class_labels = {}
 
-    return train_generator, val_generator
+# ---------------------- #
+# 🔹 Model Building
+# ---------------------- #
+def build_transfer_learning_model(num_classes):
+    base_model = MobileNetV2(weights="imagenet", include_top=False, input_shape=(128, 128, 3))
+    base_model.trainable = False  # Freeze the base layers
 
-# CNN Model Definition
-def build_model(num_classes):
-    model = tf.keras.Sequential([
-        tf.keras.layers.Conv2D(32, (3, 3), activation="relu", input_shape=(128, 128, 3)),
-        tf.keras.layers.MaxPooling2D(2, 2),
-        tf.keras.layers.Conv2D(64, (3, 3), activation="relu"),
-        tf.keras.layers.MaxPooling2D(2, 2),
-        tf.keras.layers.Flatten(),
-        tf.keras.layers.Dense(128, activation="relu"),
-        tf.keras.layers.Dense(num_classes, activation="softmax")
-    ])
+    x = layers.GlobalAveragePooling2D()(base_model.output)
+    x = layers.Dense(128, activation="relu")(x)
+    output = layers.Dense(num_classes, activation="softmax")(x)
+
+    model = Model(inputs=base_model.input, outputs=output)
+    model.compile(loss="sparse_categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
     
-    model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
     return model
 
-# Train Model Route
+# ---------------------- #
+# 🔹 Training Function
+# ---------------------- #
+def train_model(class_name):
+    global model, class_labels
+
+    class_folder = os.path.join(TRAIN_FOLDER, class_name)
+    image_files = [os.path.join(class_folder, f) for f in os.listdir(class_folder)]
+    
+    if len(image_files) < 5:  # Require at least 5 images for training
+        return f"Error: Not enough images for training {class_name}."
+
+    # Convert images to arrays
+    image_data = []
+    for img_path in image_files:
+        img = load_img(img_path, target_size=(128, 128))
+        img_array = img_to_array(img) / 255.0
+        image_data.append(img_array)
+    
+    image_data = np.array(image_data)
+    labels = np.array([class_labels[class_name]] * len(image_data))
+
+    num_classes = len(class_labels)
+
+    if model is None:
+        model = build_transfer_learning_model(num_classes)
+    else:
+        # Add new output layer
+        x = model.layers[-2].output
+        output = layers.Dense(num_classes, activation="softmax")(x)
+        model = Model(inputs=model.input, outputs=output)
+        model.compile(loss="sparse_categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
+
+    model.fit(image_data, labels, epochs=5, batch_size=8, verbose=1)
+
+    # Save model and class labels
+    model.save(MODEL_PATH)
+    with open(LABELS_PATH, "w") as f:
+        json.dump(class_labels, f)
+
+    return f"✅ Training complete for {class_name}!"
+
+# ---------------------- #
+# 🔹 Upload & Train Route
+# ---------------------- #
 @app.route("/train", methods=["POST"])
-def train_model():
-    try:
-        train_gen, val_gen = preprocess_images()
-        num_classes = len(train_gen.class_indices)
+def train():
+    if "file" not in request.files or "class_name" not in request.form:
+        return jsonify({"error": "Missing file or class_name"}), 400
 
-        if num_classes < 2:
-            return jsonify({"error": "Please upload at least two classes of images."}), 400
+    class_name = request.form["class_name"]
 
-        model = build_model(num_classes)
+    if class_name not in class_labels:
+        class_labels[class_name] = len(class_labels)
 
-        if model is None:
-            return jsonify({"error": "Failed to build the model."}), 500
-
-        model.fit(train_gen, validation_data=val_gen, epochs=5)  # Train model
-        model.save(MODEL_PATH)
-
-        return jsonify({"message": "Training complete!"}), 200
-
-    except Exception as e:
-        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
-
-# Upload Images Route
-@app.route("/upload", methods=["POST"])
-def upload_images():
-    class_name = request.form.get("class_name")  # Get class name
-    if not class_name:
-        return jsonify({"error": "Class name required."}), 400
-
-    class_folder = os.path.join(TRAIN_FOLDER, secure_filename(class_name))
+    class_folder = os.path.join(TRAIN_FOLDER, class_name)
     os.makedirs(class_folder, exist_ok=True)
 
-    files = request.files.getlist("images")
-    if not files:
-        return jsonify({"error": "No images uploaded."}), 400
+    files = request.files.getlist("file")
 
     for file in files:
-        file.save(os.path.join(class_folder, secure_filename(file.filename)))
+        file_path = os.path.join(class_folder, file.filename)
+        file.save(file_path)
 
-    return jsonify({"message": f"Uploaded {len(files)} images to class '{class_name}'."})
+    # Train in the background
+    threading.Thread(target=train_model, args=(class_name,)).start()
 
-# Classify Image Route
-@app.route("/classify", methods=["POST"])
-def classify_image():
-    try:
-        if not os.path.exists(MODEL_PATH):
-            return jsonify({"error": "Model not trained yet. Please train first."}), 400
+    return jsonify({"message": f"Training started for {class_name}"}), 200
 
-        if "image" not in request.files:
-            return jsonify({"error": "No image uploaded."}), 400
+# ---------------------- #
+# 🔹 Prediction Route
+# ---------------------- #
+@app.route("/predict", methods=["POST"])
+def predict():
+    if not os.path.exists(MODEL_PATH):
+        return jsonify({"error": "Model not trained yet. Please train first."}), 400
 
-        file = request.files["image"]
-        image_path = os.path.join(UPLOAD_FOLDER, secure_filename(file.filename))
-        file.save(image_path)
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded."}), 400
 
-        # Load model
-        model = tf.keras.models.load_model(MODEL_PATH)
+    file = request.files["file"]
+    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(file_path)
 
-        # Preprocess the image
-        img = load_img(image_path, target_size=(128, 128))
-        img_array = img_to_array(img) / 255.0
-        img_array = np.expand_dims(img_array, axis=0)
+    img = load_img(file_path, target_size=(128, 128))
+    img_array = img_to_array(img) / 255.0
+    img_array = np.expand_dims(img_array, axis=0)
 
-        # Get predictions
-        predictions = model.predict(img_array)
-        confidence = float(np.max(predictions))  # Convert float32 to standard Python float
-        class_labels = sorted(os.listdir(TRAIN_FOLDER))  # Sorted to match model's output order
-        predicted_class = class_labels[np.argmax(predictions)]  # Get class with highest probability
+    predictions = model.predict(img_array)
+    predicted_class_index = np.argmax(predictions)
+    predicted_class = list(class_labels.keys())[list(class_labels.values()).index(predicted_class_index)]
+    confidence = float(np.max(predictions)) * 100
 
-        return jsonify({"prediction": predicted_class, "confidence": round(confidence * 100, 2)})  # Confidence in %
+    return jsonify({"prediction": predicted_class, "confidence": round(confidence, 2)})
 
-    except Exception as e:
-        return jsonify({"error": f"Classification error: {str(e)}"}), 500
-
-# Home Route
+# ---------------------- #
+# 🔹 Home Route
+# ---------------------- #
 @app.route("/")
 def home():
-    return render_template("index.html")
+    return "Face Recognition API is Running!"
 
-# Run Flask App
+# ---------------------- #
+# 🔹 Run Flask App
+# ---------------------- #
 if __name__ == "__main__":
     app.run(debug=True)
